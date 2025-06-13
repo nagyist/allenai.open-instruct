@@ -57,7 +57,7 @@ from argparse import Namespace
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from queue import Empty, Queue
-from typing import Callable, Iterator, List, Literal, Optional
+from typing import Callable, Iterator, List, Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -282,6 +282,12 @@ class Args:
     llm_judge_timeout: int = 60
     """the timeout to use for the llm judge"""
 
+    # -- code verifier
+    code_api_url: str = os.environ.get("CODE_API_URL", "http://localhost:1234") + "/test_program"
+    """the api url to use for the code verifier"""
+    code_max_execution_time: float = 1.0
+    """the max execution time to use for the code verifier"""
+
     # -- non stop penalty
     non_stop_penalty: bool = False
     """whether to penalize responses which did not finish generation"""
@@ -481,9 +487,10 @@ class PolicyTrainerRayProcess(RayProcess):
         # next line instructs transformers to partition the model directly over multiple gpus using
         # deepspeed.zero.Init when model's `from_pretrained` method is called.
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            HfDeepSpeedConfig(ds_config)
+            dschf = HfDeepSpeedConfig(ds_config)
         else:
-            pass
+            dschf = None
+        print(f"{dschf=}")
 
         self.policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
@@ -589,9 +596,10 @@ class PolicyTrainerRayProcess(RayProcess):
         ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
         ds_config["gradient_accumulation_steps"] = 1
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            HfDeepSpeedConfig(ds_config)
+            dschf = HfDeepSpeedConfig(ds_config)
         else:
-            pass
+            dschf = None
+        print(f"{dschf=}")
         self.ref_policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
             revision=model_config.model_revision,
@@ -1597,6 +1605,7 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
         args.vllm_num_engines,
         args.vllm_tensor_parallel_size,
         args.vllm_enforce_eager,
+        tc.tokenizer_name_or_path,
         model_config.model_name_or_path,
         model_config.model_revision,
         args.seed,
@@ -1925,18 +1934,16 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
 if __name__ == "__main__":
     parser = ArgumentParserPlus((Args, TokenizerConfig, ModelConfig))
     args, tokenizer_config, model_config = parser.parse_args_into_dataclasses()
-    verifier_config = VerifierConfig.from_args(args)
     assert isinstance(args, Args)
     assert isinstance(tokenizer_config, TokenizerConfig)
     assert isinstance(model_config, ModelConfig)
-    assert isinstance(verifier_config, VerifierConfig)
 
-    reward_fn_mapping = build_all_verifiers(verifier_config)
+    reward_fn_mapping = build_all_verifiers(args)
 
     async def reward_fn(
         responses: List[torch.Tensor],
         decoded_responses: List[str],
-        ground_truths: List[str],
+        ground_truths: List[Union[str, List[str]]],
         datasets: List[str],
         finish_reasons: List[str],
         infos: List[List[int]],
