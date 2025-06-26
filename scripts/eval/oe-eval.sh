@@ -47,9 +47,10 @@ set -ex
 
 # Function to print usage
 usage() {
-    echo "Usage: $0 --model-name MODEL_NAME --model-location MODEL_LOCATION [--num_gpus GPUS] [--upload_to_hf] [--revision REVISION] [--max-length <max_length>] [--unseen-evals] [--priority priority] [--tasks TASKS] [--evaluate_on_weka] [--stop-sequences <comma_separated_stops>] [--beaker-image <beaker_image>] [--cluster <clusters>]"
+    echo "Usage: $0 --model-name MODEL_NAME --model-location MODEL_LOCATION [--num_gpus GPUS] [--upload_to_hf] [--revision REVISION] [--max-length <max_length>] [--unseen-evals] [--priority priority] [--tasks TASKS] [--evaluate_on_weka] [--stop-sequences <comma_separated_stops>] [--beaker-image <beaker_image>] [--cluster <clusters>] [--process-output <process_output>]"
     echo "TASKS should be a comma-separated list of task specifications (e.g., 'gsm8k::tulu,bbh:cot::tulu')"
     echo "STOP_SEQUENCES should be a comma-separated list of strings to stop generation at (e.g., '</answer>,\\n\\n')"
+    echo "PROCESS_OUTPUT should be a string specifying how to process the model output (e.g., 'r1_style')"
     exit 1
 }
 
@@ -71,6 +72,7 @@ while [[ "$#" -gt 0 ]]; do
         --stop-sequences) STOP_SEQUENCES="$2"; shift ;;
         --beaker-image) BEAKER_IMAGE="$2"; shift ;;
         --cluster) CLUSTER="$2"; shift ;;
+        --process-output) PROCESS_OUTPUT="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; usage ;;
     esac
     shift
@@ -183,6 +185,13 @@ GPU_COUNT="$NUM_GPUS"
 GPU_COUNT_OTHER=$((NUM_GPUS * 2))
 MODEL_TYPE_OTHER=""
 
+# Build model args JSON with optional process_output
+MODEL_ARGS="{\"model_path\":\"${MODEL_LOCATION}\", \"max_length\": ${MAX_LENGTH}"
+if [[ -n "$PROCESS_OUTPUT" ]]; then
+    MODEL_ARGS+=", \"process_output\": \"${PROCESS_OUTPUT}\""
+fi
+MODEL_ARGS+="}"
+
 for TASK in "${TASKS[@]}"; do
     # mmlu and truthfulqa need different batch sizes and gpu counts because they are multiple choice and we cannot use vllm.
     if [[ "$TASK" == "mmlu:mc::tulu" || "$TASK" == "truthfulqa::tulu" ]]; then
@@ -195,6 +204,7 @@ for TASK in "${TASKS[@]}"; do
         GPU_COUNT="$NUM_GPUS"
     fi
 
+    # NOTE: For gantry args here and below, random numbers like #42 are added to the env variables because they need to be unique names. The numbers are ignored.
     if [ "$EVALUATE_ON_WEKA" == "true" ]; then
         python oe-eval-internal/oe_eval/launch.py \
             --model "$MODEL_NAME" \
@@ -203,11 +213,10 @@ for TASK in "${TASKS[@]}"; do
             --task "$TASK" \
             $MODEL_TYPE \
             --batch-size "$BATCH_SIZE" \
-            --model-args "{\"model_path\":\"${MODEL_LOCATION}\", \"max_length\": ${MAX_LENGTH}}" \
+            --model-args "$MODEL_ARGS" \
             --task-args "{ \"generation_kwargs\": { \"max_gen_toks\": ${MAX_LENGTH}, \"truncate_context\": false${STOP_SEQUENCES_JSON} } }" \
             ${HF_UPLOAD_ARG} \
             --gpus "$GPU_COUNT" \
-            # NOTE: For gantry args here and below, random numbers like #42 are added to the env variables because they need to be unique names. The numbers are ignored.
             --gantry-args '{"env-secret": "OPENAI_API_KEY=openai_api_key", "weka": "oe-adapt-default:/weka/oe-adapt-default", "env#132":"VLLM_ALLOW_LONG_MAX_MODEL_LEN=1", "env-secret#42": "AZURE_EVAL_API_KEY=azure_eval_api_key"}' \
             ${REVISION_ARG} \
             --cluster "$CLUSTER" \
@@ -224,7 +233,7 @@ for TASK in "${TASKS[@]}"; do
         --task "$TASK" \
         $MODEL_TYPE \
         --batch-size "$BATCH_SIZE" \
-        --model-args "{\"model_path\":\"${MODEL_LOCATION}\", \"max_length\": ${MAX_LENGTH}}" \
+        --model-args "$MODEL_ARGS" \
         --task-args "{ \"generation_kwargs\": { \"max_gen_toks\": ${MAX_LENGTH}, \"truncate_context\": false${STOP_SEQUENCES_JSON} } }" \
         ${HF_UPLOAD_ARG} \
         --gpus "$GPU_COUNT" \

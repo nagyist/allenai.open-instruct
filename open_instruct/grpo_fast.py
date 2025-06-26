@@ -44,6 +44,7 @@ except Exception:
 
 import asyncio
 import json
+import math
 import os
 import shutil
 import socket
@@ -54,7 +55,7 @@ from argparse import Namespace
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from queue import Empty, Queue
-from typing import Callable, Dict, Iterator, List, Literal, Optional
+from typing import Callable, Dict, Iterator, List, Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -198,6 +199,8 @@ class Args:
     """RUNTIME VALUE: The frequency of evaluation steps"""
     save_freq: int = -1
     """How many train steps to save the model"""
+    allow_world_padding: bool = False
+    """Whether to allow world padding. This is useful for model sweeps, but wastes compute."""
 
     # Generation
     response_length: int = 256
@@ -262,7 +265,7 @@ class Args:
     verification_reward: float = 10.0
     """the reward value for verifiable responses"""
 
-    # -- llm verifiers reward
+    # -- llm verifiers
     llm_judge_model: str = "azure/gpt-4o-mini-standard"
     """the model to use for the llm judge"""
     llm_judge_max_tokens: int = 2048
@@ -271,6 +274,12 @@ class Args:
     """the temperature to use for the llm judge"""
     llm_judge_timeout: int = 60
     """the timeout to use for the llm judge"""
+
+    # -- code verifier
+    code_api_url: str = os.environ.get("CODE_API_URL", "http://localhost:1234") + "/test_program"
+    """the api url to use for the code verifier"""
+    code_max_execution_time: float = 1.0
+    """the max execution time to use for the code verifier"""
 
     # -- non stop penalty
     non_stop_penalty: bool = False
@@ -518,9 +527,10 @@ class PolicyTrainerRayProcess(RayProcess):
         # next line instructs transformers to partition the model directly over multiple gpus using
         # deepspeed.zero.Init when model's `from_pretrained` method is called.
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            HfDeepSpeedConfig(ds_config)
+            dschf = HfDeepSpeedConfig(ds_config)
         else:
-            pass
+            dschf = None
+        print(f"{dschf=}")
 
         self.policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
@@ -588,9 +598,11 @@ class PolicyTrainerRayProcess(RayProcess):
         ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
         ds_config["gradient_accumulation_steps"] = 1
         if ds_config is not None and ds_config["zero_optimization"]["stage"] == 3:
-            HfDeepSpeedConfig(ds_config)
+            dschf = HfDeepSpeedConfig(ds_config)
         else:
-            pass
+            dschf = None
+        print(f"{dschf=}")
+
         self.ref_policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_config.model_name_or_path,
             revision=model_config.model_revision,
@@ -741,7 +753,15 @@ class PolicyTrainerRayProcess(RayProcess):
         to_device_inplace(collated_position_ids, self.device)
         to_device_inplace(collated_advantages, self.device)
         to_device_inplace(collated_response_masks, self.device)
-        accumulation_steps = len(collated_query_responses) // (num_mini_batches)
+        accumulation_steps = math.ceil(len(collated_query_responses) / num_mini_batches - 0.5)
+        leftover = len(collated_query_responses) % accumulation_steps
+        if leftover > 0:
+            collated_query_responses = collated_query_responses[0:-leftover]
+            collated_tool_masks = collated_tool_masks[0:-leftover]
+            collated_attention_masks = collated_attention_masks[0:-leftover]
+            collated_position_ids = collated_position_ids[0:-leftover]
+            collated_advantages = collated_advantages[0:-leftover]
+            collated_response_masks = collated_response_masks[0:-leftover]
 
         # Calculate the logprob of the reference policy
         collated_ref_logprobs = []
@@ -1212,6 +1232,31 @@ def data_preparation_thread(
             ]
             packed_sequences.advantages = packed_advantages
 
+        # if we have less batches than world size, we need to pad out so each world is fine
+        # ideally, you should avoid this since its wasting computation.
+        if args.allow_world_padding:
+            with Timer("🤺 [Data Preparation Thread] Padding sequences for world size"):
+                shortfall = args.world_size - len(packed_sequences.query_responses)
+                if shortfall > 0:
+                    print(
+                        f"Padding {shortfall} sequences for world size. In future, you should adjust your compute this."
+                    )
+                    # construct "dummy" sequences for padding out the world size
+                    dummy_qr = torch.tensor([tokenizer.pad_token_id, tokenizer.eos_token_id], dtype=torch.long)
+                    dummy_tool_mask = torch.zeros_like(dummy_qr)
+                    dummy_attention = torch.tensor([1, 1], dtype=torch.long)
+                    dummy_position_ids = torch.arange(len(dummy_qr), dtype=torch.long)
+                    dummy_response_mask = torch.zeros_like(dummy_qr)
+                    dummy_advantage = torch.zeros_like(dummy_qr, dtype=torch.float)
+                    # pad out the world size
+                    for _ in range(shortfall):
+                        packed_sequences.query_responses.append(dummy_qr)
+                        packed_sequences.tool_masks.append(dummy_tool_mask)
+                        packed_sequences.attention_masks.append(dummy_attention)
+                        packed_sequences.position_ids.append(dummy_position_ids)
+                        packed_sequences.response_masks.append(dummy_response_mask)
+                        packed_sequences.advantages.append(dummy_advantage)
+
         with Timer("🔄 [Data Preparation Thread] Prepare collated data for each worker"):
             B = (
                 len(packed_sequences.query_responses) // args.world_size
@@ -1501,6 +1546,7 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig, reward_fn: 
         args.vllm_num_engines,
         args.vllm_tensor_parallel_size,
         args.vllm_enforce_eager,
+        tc.tokenizer_name_or_path,
         model_config.model_name_or_path,
         model_config.model_revision,
         args.seed,
@@ -1852,7 +1898,7 @@ if __name__ == "__main__":
     async def reward_fn(
         responses: List[torch.Tensor],
         decoded_responses: List[str],
-        ground_truths: List[str],
+        ground_truths: List[Union[str, List[str]]],
         datasets: List[str],
         finish_reasons: List[str],
         infos: List[List[int]],
