@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+import accelerate
 import torch
 import torch.distributed as dist
 import transformers
@@ -14,7 +15,8 @@ from olmo_core import optim as olmo_optim
 from olmo_core.data import TokenizerConfig as OLMoCoreTokenizerConfig
 from olmo_core.distributed.utils import get_rank, get_world_size, is_distributed
 from olmo_core.nn.attention import AttentionBackendName
-from olmo_core.nn.hf.checkpoint import load_hf_model, save_hf_model
+from olmo_core.nn.hf import convert as olmo_hf_convert
+from olmo_core.nn.hf.checkpoint import load_hf_model
 from olmo_core.nn.rope import YaRNRoPEScalingConfig
 from olmo_core.nn.transformer import Transformer, TransformerConfig
 from olmo_core.train import callbacks as train_callbacks
@@ -46,11 +48,11 @@ class ExperimentConfig:
     """Separate seed for data loader instance ordering. If None, uses seed."""
 
 
-@dataclass
+@dataclass(kw_only=True)
 class ModelConfig:
     """Configuration for model loading."""
 
-    model_name_or_path: str | None = None
+    model_name_or_path: str
     """The model checkpoint for weights initialization."""
     config_name: str | None = None
     """Pretrained config name or path if not the same as model_name."""
@@ -445,20 +447,62 @@ def to_oc_tokenizer_config(tc: TokenizerConfig) -> OLMoCoreTokenizerConfig:
     )
 
 
-def save_state_dict_as_hf(model_config, state_dict, save_dir, original_model_name_or_path, tokenizer):
-    try:
-        unwrapped_model = model_config.build(init_device="cpu")
-        unwrapped_model.load_state_dict(state_dict)
-        save_hf_model(save_dir=save_dir, model_state_dict=state_dict, model=unwrapped_model, save_overwrite=True)
-    except NotImplementedError as exc:
-        logger.warning(
-            "Falling back to raw state_dict save because HF export is unsupported for this OLMo-core model: %s", exc
+def verify_can_save_as_hf(model_config: TransformerConfig, original_model_name_or_path: str) -> None:
+    """Fail fast if the run cannot later be exported to HF format.
+
+    Builds the olmo-core model and the target HF model on meta, runs the
+    state-dict converter, and verifies the converted keys exactly cover the HF
+    model's expected parameters. Raises before any training starts.
+    """
+    hf_config = transformers.AutoConfig.from_pretrained(original_model_name_or_path, trust_remote_code=True)
+    olmo_core_model = model_config.build(init_device="meta")
+    olmo_core_state = olmo_core_model.state_dict()
+
+    converted = olmo_hf_convert.convert_state_to_hf(hf_config, olmo_core_state)
+
+    with accelerate.init_empty_weights():
+        hf_model = transformers.AutoModelForCausalLM.from_config(hf_config)
+    expected = set(hf_model.state_dict().keys())
+    produced = set(converted.keys())
+
+    missing = expected - produced
+    extra = produced - expected
+    if missing or extra:
+        raise RuntimeError(
+            f"HF export is not implemented for {original_model_name_or_path} "
+            f"(model_type={getattr(hf_config, 'model_type', None)}). "
+            f"Missing keys: {sorted(missing)}. Extra keys: {sorted(extra)}."
         )
-        os.makedirs(save_dir, exist_ok=True)
-        torch.save(state_dict, os.path.join(save_dir, "model_state_dict.pt"))
+    logger.info(
+        f"Verified HF export works for {original_model_name_or_path} "
+        f"(model_type={getattr(hf_config, 'model_type', None)}, {len(expected)} params)."
+    )
+
+
+def save_state_dict_as_hf(
+    state_dict: dict[str, torch.Tensor],
+    save_dir: str,
+    original_model_name_or_path: str,
+    tokenizer: transformers.PreTrainedTokenizerBase,
+) -> None:
+    """Convert an olmo-core state dict to HuggingFace format and save it to disk.
+
+    Loads the target HF config from ``original_model_name_or_path``, converts the
+    olmo-core ``state_dict`` keys/shapes to the matching HF layout, materializes
+    an HF model with those weights, and writes the model + tokenizer to
+    ``save_dir``.
+    """
+    hf_config = transformers.AutoConfig.from_pretrained(original_model_name_or_path, trust_remote_code=True)
+    converted = olmo_hf_convert.convert_state_to_hf(hf_config, state_dict)
+    converted = {k: v.contiguous() for k, v in converted.items()}
+
+    with accelerate.init_empty_weights():
+        hf_model = transformers.AutoModelForCausalLM.from_config(hf_config)
+    hf_model.load_state_dict(converted, assign=True)
+
+    os.makedirs(save_dir, exist_ok=True)
+    hf_model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
-    original_config = transformers.AutoConfig.from_pretrained(original_model_name_or_path)
-    original_config.save_pretrained(save_dir)
 
 
 def doc_lens_from_attention_mask(attention_mask_BS: torch.Tensor) -> tuple[torch.Tensor, list[int]]:
